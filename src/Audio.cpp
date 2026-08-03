@@ -603,6 +603,9 @@ bool Audio::openai_speech(const String& api_key, const String& model, const Stri
     if (res) {
         uint32_t dt = millis() - t;
         m_lastHost.assign(host.get());
+        m_lastHostAuthUrl.reset();
+        m_lastHostAuthUser.reset();
+        m_lastHostAuthPassword.reset();
         m_currentHost.clone_from(host);
         info(*this, evt_info, "{} has been established in {} ms", m_f_ssl ? "SSL" : "Connection", dt);
         m_f_running = true;
@@ -806,6 +809,15 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
 
         m_currentHost = c_host;
         m_lastHost = c_host;
+        if (authLen > 0) {
+            m_lastHostAuthUrl = c_host;
+            m_lastHostAuthUser = c_user;
+            m_lastHostAuthPassword = c_pwd;
+        } else {
+            m_lastHostAuthUrl.reset();
+            m_lastHostAuthUser.reset();
+            m_lastHostAuthPassword.reset();
+        }
         info(*this, evt_lasthost, "{}", m_lastHost.c_get());
         m_dataMode = HTTP_RESPONSE_HEADER; // Handle header
         m_streamType = ST_WEBSTREAM;
@@ -815,6 +827,20 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
     }
     xSemaphoreGiveRecursive(mutex_playAudioData);
     return res;
+}
+// —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+bool Audio::reconnecttohost() {
+    if (!m_lastHost.valid()) {
+        AUDIO_LOG_ERROR("m_lastHost is empty");
+        return false;
+    }
+
+    // Credentials must never be forwarded after another API changes m_lastHost.
+    const bool useStoredAuth = m_lastHostAuthUrl.valid() && m_lastHostAuthUser.valid() && m_lastHostAuthPassword.valid() &&
+                               m_lastHost.equals(m_lastHostAuthUrl.get());
+
+    return connecttohost(m_lastHost.get(), useStoredAuth ? m_lastHostAuthUser.get() : nullptr,
+                         useStoredAuth ? m_lastHostAuthPassword.get() : nullptr);
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 bool Audio::httpPrint(const char* host) {
@@ -1116,6 +1142,9 @@ bool Audio::connecttospeech(const char* speech, const char* lang) {
     m_f_tts = true;
     m_dataMode = HTTP_RESPONSE_HEADER;
     m_lastHost.assign(host);
+    m_lastHostAuthUrl.reset();
+    m_lastHostAuthUser.reset();
+    m_lastHostAuthPassword.reset();
     m_currentHost.copy_from(host);
     xSemaphoreGiveRecursive(mutex_playAudioData);
     return true;
@@ -3478,7 +3507,7 @@ void Audio::loop() {
                     if (m_f_timeout && m_lVar.count < 3) {
                         m_f_timeout = false;
                         m_lVar.count++;
-                        connecttohost(m_lastHost.get());
+                        reconnecttohost();
                     }
                 } else {
                     m_lVar.count = 0;
@@ -3502,7 +3531,7 @@ void Audio::loop() {
                 if (!parseHttpResponseHeader()) {
                     if (m_lVar.count < 3) {
                         m_lVar.count++;
-                        connecttohost(m_lastHost.get());
+                        reconnecttohost();
                     } else {
                         stopSong();
                     }
@@ -4855,7 +4884,7 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
             if (sc == 403 && !m_f_alt_user_agent) { // HTTP/1.1 403 Forbidden
                 m_f_alt_user_agent = true;
                 AUDIO_LOG_WARN("403 Forbidden, test alternative user agent");
-                connecttohost(m_lastHost.c_get());
+                reconnecttohost();
                 return true;
             }
             m_f_alt_user_agent = false;
@@ -5566,7 +5595,7 @@ uint32_t Audio::decodeError(int8_t res, uint8_t* data, int32_t bytesDecoded) {
     if (m_codec == CODEC_MP3) {
         if (res == MP3Decoder::MP3_NEED_RESTART) {
             info(*this, evt_info, "" ANSI_ESC_RED "Network error" ANSI_ESC_RESET "");
-            connecttohost(m_lastHost.get());
+            reconnecttohost();
             return 0;
         }
     }
@@ -7297,7 +7326,7 @@ boolean Audio::streamDetection(uint32_t bytesAvail) {
     // if no audio data is received within 10 seconds, a new connection attempt is started.
     if (m_sdet.cnt_lost == 5) {
         info(*this, evt_info, "Stream lost");
-        connecttohost(m_lastHost.get());
+        reconnecttohost();
         m_sdet.cnt_slow = 0;
         m_sdet.cnt_lost = 0;
         return false;

@@ -250,6 +250,7 @@ class Audio {
     bool                     parseContentType(ps_ptr<char> ct);
     bool                     parseHttpResponseHeader();
     bool                     parseHttpRangeHeader();
+    bool                     reconnecttohost();
     bool                     initializeDecoder();
     esp_err_t                I2Sstart();
     esp_err_t                I2Sstop();
@@ -409,6 +410,9 @@ class Audio {
     ps_ptr<char>             m_httpRespHdrBuff; // store http response header
     ps_ptr<char>             m_ibuff;           // used in log_info()
     ps_ptr<char>             m_lastHost;        // Store the last URL to a webstream
+    ps_ptr<char>             m_lastHostAuthUrl; // URL associated with stored Basic Auth credentials
+    ps_ptr<char>             m_lastHostAuthUser;
+    ps_ptr<char>             m_lastHostAuthPassword;
     ps_ptr<char>             m_currentHost;     // can be changed by redirection or playlist
     ps_ptr<char>             m_m3u8_host;
     ps_ptr<char>             m_speechtxt;   // stores tts text
