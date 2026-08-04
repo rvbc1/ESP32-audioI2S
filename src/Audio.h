@@ -47,6 +47,7 @@ class AudioBuffer {
     AudioBuffer();   // constructor
     ~AudioBuffer();  // frees the buffer
     size_t   init(); // set default values
+    bool     setBufsize(size_t bytes);
     bool     isInitialized() { return m_init; };
     size_t   getBufsize();
     size_t   getMaxBlockSize(); // returns maxBlockSize
@@ -157,6 +158,9 @@ class Audio {
     bool             setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK = I2S_GPIO_UNUSED);
     bool             pauseResume();
     bool             isRunning() { return m_f_running; }
+    bool             setInputBufferSize(size_t bytes);
+    bool             isBuffering() { return m_f_buffering; }
+    uint32_t         getRebufferCount() { return m_rebufferCount; }
     void             loop();
     uint32_t         stopSong();
     void             forceMono(bool m);
@@ -370,6 +374,8 @@ class Audio {
         bool     SPECTRUM = false;                 // true: spectrum analyzer is enabled
         bool     VOLUME_CONTROL = true;            // true: volume and balance control is enabled
         float    VOL_FADING_SPEED = 50.0;          // mute, volume fading 1.0f (fast) ... 100.0f (slow)
+        uint32_t BUFFER_THRESHOLD_WEBSTREAM = 0;    // bytes required before a continuous web stream starts or resumes; 0 keeps legacy behavior
+        uint32_t BUFFER_PRELOAD_TIMEOUT_MS = 0;     // maximum preload time before starting with at least one complete frame; 0 disables the timeout
         uint32_t BUFFER_TRESHOLD_HLS = UINT16_MAX; // Level at which the HLS-TS stream starts and is reloaded
     } settings;
 
@@ -468,6 +474,7 @@ class Audio {
     bool           m_f_exthdr = false;              // ID3 extended header
     bool           m_f_ssl = false;                 //
     bool           m_f_running = false;             //
+    bool           m_f_buffering = false;           // continuous web stream is waiting for the configured input buffer level
     bool           m_f_firstCall = false;           // InitSequence for processWebstream and processLokalFile
     bool           m_f_firstLoop = false;           // InitSequence in loop()
     bool           m_f_firstPlayCall = false;       // InitSequence for playAudioData
@@ -493,6 +500,8 @@ class Audio {
     bool           m_f_lockInBuffer = false;        // lock inBuffer for manipulation
     bool           m_f_audioTaskIsDecoding = false; //
     bool           m_f_acceptRanges = false;        //
+    uint32_t       m_bufferingStartedAtMs = 0;
+    uint32_t       m_rebufferCount = 0;
     bool           m_f_reset_m3u8Codec = true;      // reset codec for m3u8 stream
     bool           m_f_connectionClose = false;     // set in parseHttpResponseHeader
     bool           m_f_i2s_channel_enabled = false; // true if enabled

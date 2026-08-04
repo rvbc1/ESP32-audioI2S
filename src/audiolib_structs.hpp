@@ -214,6 +214,7 @@ struct pwst_t { // used in processWebStream
     bool     f_clientIsConnected;
     uint32_t writeSpace = 0;
     uint16_t readedBytes;
+    uint32_t lastDataAtMs = 0;
 };
 
 struct gchs_t { // used in getChunkSize

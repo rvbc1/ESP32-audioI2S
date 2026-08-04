@@ -44,6 +44,19 @@ void loop(){
 }
 
 ````
+
+## Continuous stream buffering
+
+The input ring buffer is stored in PSRAM. Its capacity and the preload threshold for continuous web streams can be configured before the first connection:
+
+````c++
+audio.setInputBufferSize(2 * 1024 * 1024);
+audio.settings.BUFFER_THRESHOLD_WEBSTREAM = 512 * 1024;
+audio.settings.BUFFER_PRELOAD_TIMEOUT_MS = 45000;
+````
+
+When the decoder exhausts the input data, playback waits until the configured threshold is available again. `isBuffering()`, `inBufferFilled()`, `getInBufferSize()` and `getRebufferCount()` expose the current state for diagnostics. A threshold of `0` keeps the legacy continuous-stream behavior.
+
 You can find more examples here: https://github.com/schreibfaul1/ESP32-audioI2S/tree/master/examples
 
 ````c++
@@ -94,4 +107,3 @@ Impulse diagram
 Yellobyte has developed an all-in-one board. It includes an ESP32-S3 N8R2, 2x MAX98357 and an SD card adapter.
 Documentation, circuit diagrams and examples can be found here: https://github.com/yellobyte/ESP32-DevBoards-Getting-Started
 ![image](https://github.com/user-attachments/assets/4002d09e-8e76-4e08-9265-188fed7628d3)
-

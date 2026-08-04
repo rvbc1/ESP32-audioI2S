@@ -87,12 +87,19 @@ AudioBuffer::~AudioBuffer() {
     ;
 }
 
+bool AudioBuffer::setBufsize(size_t bytes) {
+    if (m_init || bytes < UINT16_MAX) return false;
+    m_mainBuffSize = bytes;
+    return true;
+}
+
 size_t AudioBuffer::getBufsize() {
     return m_mainBuffSize;
 }
 
 size_t AudioBuffer::init() {
-    m_buffer.alloc(m_mainBuffSize + m_resBuffSize, "AudioBuffer");
+    if (m_init) return m_mainBuffSize;
+    if (!m_buffer.alloc(m_mainBuffSize + m_resBuffSize, "AudioBuffer")) return 0;
     m_log.set_name("\nAudiobuffer_Log");
     m_mutex = xSemaphoreCreateBinary();
     xSemaphoreGive(m_mutex);
@@ -442,6 +449,7 @@ void Audio::setDefaults() {
     m_f_chunked = false; // Assume not chunked
     m_f_firstmetabyte = false;
     m_f_playing = false;
+    m_f_buffering = false;
     m_f_tts = false;
     m_f_firstCall = true;       // InitSequence for processWebstream and processLocalFile
     m_cat.firstCall = true;     // InitSequence for calculateAudioTime
@@ -472,6 +480,7 @@ void Audio::setDefaults() {
     m_m3u8Codec = CODEC_AAC;
 
     m_validSamples = 0;
+    m_bufferingStartedAtMs = 0;
     m_audioCurrentTime = 0;
     m_audioFileDuration = 0;
     m_resumeFilePos = -1;
@@ -499,6 +508,15 @@ void Audio::setDefaults() {
 void Audio::setConnectionTimeout(uint16_t timeout_ms, uint16_t timeout_ms_ssl) {
     if (timeout_ms) m_timeout_ms = timeout_ms;
     if (timeout_ms_ssl) m_timeout_ms_ssl = timeout_ms_ssl;
+}
+// —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+bool Audio::setInputBufferSize(size_t bytes) {
+    if (!InBuff.setBufsize(bytes)) return false;
+    size_t size = InBuff.init();
+    if (!size) return false;
+    info(*this, evt_info, "inputBufferSize: {} bytes", size);
+    return true;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 
@@ -4219,6 +4237,9 @@ void Audio::processWebStream() {
     if (m_f_firstCall) { // runs only ont time per connection, prepare for start
         m_f_firstCall = false;
         m_f_stream = false;
+        m_f_buffering = settings.BUFFER_THRESHOLD_WEBSTREAM > 0;
+        m_bufferingStartedAtMs = millis();
+        m_pwst.lastDataAtMs = m_bufferingStartedAtMs;
         m_pwst.chunkSize = 0;
         m_metacount = m_metaint;
         m_f_allDataReceived = false;
@@ -4275,6 +4296,7 @@ void Audio::processWebStream() {
             if (m_metaint) m_metacount -= bytesAddedToBuffer;
             if (m_f_chunked) m_pwst.chunkSize -= bytesAddedToBuffer;
             InBuff.bytesWritten(bytesAddedToBuffer);
+            m_pwst.lastDataAtMs = millis();
         }
     }
 
@@ -4293,10 +4315,25 @@ void Audio::processWebStream() {
             return;
     }
 
-    // start audio decoding - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    if (((InBuff.bufferFilled() > m_pwst.maxFrameSize) || (m_f_allDataReceived)) && !m_f_stream) { // waiting for buffer filled
-        info(*this, evt_info, "stream ready");
-        m_f_stream = true; // ready to play the audio data
+    // start or resume audio decoding - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    if (!m_f_stream || m_f_buffering) {
+        const uint32_t minimumBytes = max((uint32_t)m_pwst.maxFrameSize, (uint32_t)1);
+        const uint32_t configuredThreshold = settings.BUFFER_THRESHOLD_WEBSTREAM > 0 ? settings.BUFFER_THRESHOLD_WEBSTREAM : minimumBytes;
+        const uint32_t capacity = InBuff.getBufsize();
+        const uint32_t startThreshold = min(max(configuredThreshold, minimumBytes), capacity);
+        const uint32_t filled = InBuff.bufferFilled();
+        const bool preloadTimedOut = settings.BUFFER_PRELOAD_TIMEOUT_MS > 0 &&
+                                     (millis() - m_bufferingStartedAtMs >= settings.BUFFER_PRELOAD_TIMEOUT_MS);
+
+        if (filled >= startThreshold || (preloadTimedOut && filled >= minimumBytes) || m_f_allDataReceived) {
+            info(*this, evt_info, m_rebufferCount > 0 ? "stream rebuffered" : "stream ready");
+            m_f_stream = true;
+            m_f_buffering = false;
+        } else if (m_f_buffering && millis() - m_pwst.lastDataAtMs >= 10000) {
+            info(*this, evt_info, "Stream lost while buffering");
+            reconnecttohost();
+            return;
+        }
     }
 
     if (m_f_eof) {
@@ -4687,7 +4724,7 @@ void Audio::processWebStreamHLS() {
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::playAudioData() {
 
-    if (m_f_eof || m_f_lockInBuffer || !m_f_stream) {
+    if (m_f_eof || m_f_lockInBuffer || !m_f_stream || m_f_buffering) {
         vTaskDelay(1);
         return;
     } // guard, stream not ready or eof reached or InBuff is locked or not running
@@ -4743,7 +4780,15 @@ void Audio::playAudioData() {
                 m_pad.bytesDecoded = sendBytes(InBuff.getReadPtr(), m_pad.bytesToDecode);
             } else {
                 m_pad.bytesToDecode = InBuff.readSpace();
-                if (m_pad.bytesToDecode >= InBuff.getMaxBlockSize()) { m_pad.bytesDecoded = sendBytes(InBuff.getReadPtr(), m_pad.bytesToDecode); }
+                if (m_pad.bytesToDecode >= InBuff.getMaxBlockSize()) {
+                    m_pad.bytesDecoded = sendBytes(InBuff.getReadPtr(), m_pad.bytesToDecode);
+                } else if (settings.BUFFER_THRESHOLD_WEBSTREAM > 0 && m_streamType == ST_WEBSTREAM && m_playlistFormat != FORMAT_M3U8 &&
+                           InBuff.bufferFilled() < InBuff.getMaxBlockSize()) {
+                    m_f_buffering = true;
+                    m_bufferingStartedAtMs = millis();
+                    m_rebufferCount++;
+                    info(*this, evt_info, "stream buffering");
+                }
             }
         }
 
