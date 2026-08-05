@@ -374,8 +374,10 @@ class Audio {
         bool     SPECTRUM = false;                 // true: spectrum analyzer is enabled
         bool     VOLUME_CONTROL = true;            // true: volume and balance control is enabled
         float    VOL_FADING_SPEED = 50.0;          // mute, volume fading 1.0f (fast) ... 100.0f (slow)
-        uint32_t BUFFER_THRESHOLD_WEBSTREAM = 0;    // bytes required before a continuous web stream starts or resumes; 0 keeps legacy behavior
-        uint32_t BUFFER_PRELOAD_TIMEOUT_MS = 0;     // maximum preload time before starting with at least one complete frame; 0 disables the timeout
+        uint32_t BUFFER_THRESHOLD_WEBSTREAM = 0;         // bytes required before a continuous web stream resumes; also used for initial start unless overridden
+        uint32_t BUFFER_THRESHOLD_WEBSTREAM_INITIAL = 0; // bytes required before the initial start; 0 uses BUFFER_THRESHOLD_WEBSTREAM
+        uint32_t BUFFER_PRELOAD_TIMEOUT_MS = 0;          // maximum rebuffer time before resuming with at least one complete frame; 0 disables the timeout
+        uint32_t BUFFER_INITIAL_PRELOAD_TIMEOUT_MS = 0;  // maximum initial preload time; 0 uses BUFFER_PRELOAD_TIMEOUT_MS
         uint32_t BUFFER_TRESHOLD_HLS = UINT16_MAX; // Level at which the HLS-TS stream starts and is reloaded
     } settings;
 
@@ -475,6 +477,7 @@ class Audio {
     bool           m_f_ssl = false;                 //
     bool           m_f_running = false;             //
     bool           m_f_buffering = false;           // continuous web stream is waiting for the configured input buffer level
+    bool           m_f_rebuffering = false;         // buffering follows an input underrun rather than the initial stream start
     bool           m_f_firstCall = false;           // InitSequence for processWebstream and processLokalFile
     bool           m_f_firstLoop = false;           // InitSequence in loop()
     bool           m_f_firstPlayCall = false;       // InitSequence for playAudioData

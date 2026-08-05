@@ -450,6 +450,7 @@ void Audio::setDefaults() {
     m_f_firstmetabyte = false;
     m_f_playing = false;
     m_f_buffering = false;
+    m_f_rebuffering = false;
     m_f_tts = false;
     m_f_firstCall = true;       // InitSequence for processWebstream and processLocalFile
     m_cat.firstCall = true;     // InitSequence for calculateAudioTime
@@ -4237,7 +4238,11 @@ void Audio::processWebStream() {
     if (m_f_firstCall) { // runs only ont time per connection, prepare for start
         m_f_firstCall = false;
         m_f_stream = false;
-        m_f_buffering = settings.BUFFER_THRESHOLD_WEBSTREAM > 0;
+        m_f_rebuffering = false;
+        const uint32_t initialThreshold = settings.BUFFER_THRESHOLD_WEBSTREAM_INITIAL > 0
+                                              ? settings.BUFFER_THRESHOLD_WEBSTREAM_INITIAL
+                                              : settings.BUFFER_THRESHOLD_WEBSTREAM;
+        m_f_buffering = initialThreshold > 0;
         m_bufferingStartedAtMs = millis();
         m_pwst.lastDataAtMs = m_bufferingStartedAtMs;
         m_pwst.chunkSize = 0;
@@ -4318,17 +4323,24 @@ void Audio::processWebStream() {
     // start or resume audio decoding - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     if (!m_f_stream || m_f_buffering) {
         const uint32_t minimumBytes = max((uint32_t)m_pwst.maxFrameSize, (uint32_t)1);
-        const uint32_t configuredThreshold = settings.BUFFER_THRESHOLD_WEBSTREAM > 0 ? settings.BUFFER_THRESHOLD_WEBSTREAM : minimumBytes;
+        const uint32_t initialThreshold = settings.BUFFER_THRESHOLD_WEBSTREAM_INITIAL > 0
+                                              ? settings.BUFFER_THRESHOLD_WEBSTREAM_INITIAL
+                                              : settings.BUFFER_THRESHOLD_WEBSTREAM;
+        const uint32_t configuredThreshold = m_f_rebuffering ? settings.BUFFER_THRESHOLD_WEBSTREAM : initialThreshold;
+        const uint32_t initialTimeout = settings.BUFFER_INITIAL_PRELOAD_TIMEOUT_MS > 0
+                                            ? settings.BUFFER_INITIAL_PRELOAD_TIMEOUT_MS
+                                            : settings.BUFFER_PRELOAD_TIMEOUT_MS;
+        const uint32_t configuredTimeout = m_f_rebuffering ? settings.BUFFER_PRELOAD_TIMEOUT_MS : initialTimeout;
         const uint32_t capacity = InBuff.getBufsize();
         const uint32_t startThreshold = min(max(configuredThreshold, minimumBytes), capacity);
         const uint32_t filled = InBuff.bufferFilled();
-        const bool preloadTimedOut = settings.BUFFER_PRELOAD_TIMEOUT_MS > 0 &&
-                                     (millis() - m_bufferingStartedAtMs >= settings.BUFFER_PRELOAD_TIMEOUT_MS);
+        const bool preloadTimedOut = configuredTimeout > 0 && (millis() - m_bufferingStartedAtMs >= configuredTimeout);
 
         if (filled >= startThreshold || (preloadTimedOut && filled >= minimumBytes) || m_f_allDataReceived) {
-            info(*this, evt_info, m_rebufferCount > 0 ? "stream rebuffered" : "stream ready");
+            info(*this, evt_info, m_f_rebuffering ? "stream rebuffered" : "stream ready");
             m_f_stream = true;
             m_f_buffering = false;
+            m_f_rebuffering = false;
         } else if (m_f_buffering && millis() - m_pwst.lastDataAtMs >= 10000) {
             info(*this, evt_info, "Stream lost while buffering");
             reconnecttohost();
@@ -4785,6 +4797,7 @@ void Audio::playAudioData() {
                 } else if (settings.BUFFER_THRESHOLD_WEBSTREAM > 0 && m_streamType == ST_WEBSTREAM && m_playlistFormat != FORMAT_M3U8 &&
                            InBuff.bufferFilled() < InBuff.getMaxBlockSize()) {
                     m_f_buffering = true;
+                    m_f_rebuffering = true;
                     m_bufferingStartedAtMs = millis();
                     m_rebufferCount++;
                     info(*this, evt_info, "stream buffering");

@@ -51,11 +51,13 @@ The input ring buffer is stored in PSRAM. Its capacity and the preload threshold
 
 ````c++
 audio.setInputBufferSize(2 * 1024 * 1024);
-audio.settings.BUFFER_THRESHOLD_WEBSTREAM = 512 * 1024;
+audio.settings.BUFFER_THRESHOLD_WEBSTREAM_INITIAL = 64 * 1024;
+audio.settings.BUFFER_THRESHOLD_WEBSTREAM = 256 * 1024;
+audio.settings.BUFFER_INITIAL_PRELOAD_TIMEOUT_MS = 5000;
 audio.settings.BUFFER_PRELOAD_TIMEOUT_MS = 45000;
 ````
 
-When the decoder exhausts the input data, playback waits until the configured threshold is available again. `isBuffering()`, `inBufferFilled()`, `getInBufferSize()` and `getRebufferCount()` expose the current state for diagnostics. A threshold of `0` keeps the legacy continuous-stream behavior.
+The initial threshold can be smaller for a fast first start while the ring buffer continues filling in the background. When the decoder exhausts the input data, playback waits for `BUFFER_THRESHOLD_WEBSTREAM` before it resumes. Setting either initial option to `0` makes it inherit the corresponding rebuffer option, preserving the previous behavior. `isBuffering()`, `inBufferFilled()`, `getInBufferSize()` and `getRebufferCount()` expose the current state for diagnostics. A rebuffer threshold of `0` keeps the legacy continuous-stream behavior.
 
 You can find more examples here: https://github.com/schreibfaul1/ESP32-audioI2S/tree/master/examples
 
