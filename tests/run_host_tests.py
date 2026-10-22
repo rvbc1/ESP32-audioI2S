@@ -70,6 +70,17 @@ def run_tests(repo, build, ref, expect_leak, compiler):
         subprocess.run([str(executable), str(repo / "tests/fixtures/silence-stereo-44100.aac")],
                        check=True, env=environment)
 
+    if not expect_leak:
+        for name in ("pcm_output", "bounded_queue"):
+            testcase = repo / f"tests/{name}_test.cpp"
+            if not testcase.exists():
+                continue
+            executable = build / name
+            subprocess.run([compiler, "-std=c++20", "-O1", "-g", "-fsanitize=address,undefined",
+                            "-I", str(repo / "src"), str(testcase), "-o", str(executable)], check=True)
+            subprocess.run([str(executable)], check=True, env=environment)
+            print(f"PASS: {name}", flush=True)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, help="Keep build outputs in this directory")

@@ -63,6 +63,7 @@ class MP3Decoder : public Decoder {
     ps_ptr<char>            m_mpeg_version_str;
     ps_ptr<int16_t>         m_out16;
 
+    uint8_t       m_underflowCounter = 0;
     invalid_frame m_invalid_frame;
 
     // internally used

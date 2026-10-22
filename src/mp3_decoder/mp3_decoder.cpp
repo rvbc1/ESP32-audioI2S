@@ -33,6 +33,7 @@ bool MP3Decoder::init() {
 
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void MP3Decoder::reset() {
+    m_underflowCounter = 0;
     m_MP3DecInfo.reset();
     m_FrameHeader.reset();
     m_SideInfo.reset();
@@ -47,6 +48,7 @@ void MP3Decoder::reset() {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void MP3Decoder::clear() {
+    m_underflowCounter = 0;
     /* important to do this - DSP primitives assume a bunch of state variables are 0 on first use */
     m_MP3DecInfo.clear();
     m_FrameHeader.clear();
@@ -1142,7 +1144,6 @@ int32_t MP3Decoder::decode(uint8_t* inbuf, int32_t* bytesLeft, int32_t* outbuf) 
     int32_t        offset, bitOffset, mainBits, gr, ch, fhBytes, siBytes, freeFrameBytes;
     int32_t        prevBitOffset, sfBlockBits, huffBlockBits;
     uint8_t*       mainPtr;
-    static uint8_t underflowCounter = 0; // http://macslons-irish-pub-radio.stream.laut.fm/macslons-irish-pub-radio
     /* unpack frame header */
     fhBytes = UnpackFrameHeader(inbuf);
     if (fhBytes < 0) {
@@ -1187,7 +1188,7 @@ int32_t MP3Decoder::decode(uint8_t* inbuf, int32_t* bytesLeft, int32_t* outbuf) 
     /* fill main data buffer with enough new data for this frame */
     if (m_MP3DecInfo->mainDataBytes >= m_MP3DecInfo->mainDataBegin) {
         /* adequate "old" main data available (i.e. bit reservoir) */
-        underflowCounter = 0;
+        m_underflowCounter = 0;
         memmove(m_MP3DecInfo->mainBuf, m_MP3DecInfo->mainBuf + m_MP3DecInfo->mainDataBytes - m_MP3DecInfo->mainDataBegin, m_MP3DecInfo->mainDataBegin);
         memcpy(m_MP3DecInfo->mainBuf + m_MP3DecInfo->mainDataBegin, inbuf, m_MP3DecInfo->nSlots);
 
@@ -1197,12 +1198,12 @@ int32_t MP3Decoder::decode(uint8_t* inbuf, int32_t* bytesLeft, int32_t* outbuf) 
         mainPtr = m_MP3DecInfo->mainBuf;
     } else {
         /* not enough data in bit reservoir from previous frames (perhaps starting in middle of file) */
-        underflowCounter++;
+        m_underflowCounter++;
         memcpy(m_MP3DecInfo->mainBuf + m_MP3DecInfo->mainDataBytes, inbuf, m_MP3DecInfo->nSlots);
         m_MP3DecInfo->mainDataBytes += m_MP3DecInfo->nSlots;
         inbuf += m_MP3DecInfo->nSlots;
         *bytesLeft -= (m_MP3DecInfo->nSlots);
-        if (underflowCounter < 4) { return MP3_NONE; }
+        if (m_underflowCounter < 4) { return MP3_NONE; }
         MP3ClearBadFrame(m_out16.get());
         MP3_LOG_DEBUG("MP3, maindata underflow");
         return MP3_NONE;

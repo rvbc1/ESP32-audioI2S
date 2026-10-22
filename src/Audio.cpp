@@ -44,9 +44,17 @@ constexpr size_t m_resamplesBuffSize = m_outbuffSize * 8; // SRmin: 6KHz -> SRma
 
 constexpr size_t AUDIO_STACK_SIZE = 3500;
 
-// static allocations for Audio task
-StaticTask_t __attribute__((unused)) xAudioTaskBuffer;
-StackType_t __attribute__((unused))  xAudioStack[AUDIO_STACK_SIZE];
+namespace {
+class AudioTaskGuard {
+  public:
+    explicit AudioTaskGuard(SemaphoreHandle_t mutex) : m_mutex(mutex) { xSemaphoreTakeRecursive(m_mutex, portMAX_DELAY); }
+    ~AudioTaskGuard() { xSemaphoreGiveRecursive(m_mutex); }
+    AudioTaskGuard(const AudioTaskGuard&) = delete;
+    AudioTaskGuard& operator=(const AudioTaskGuard&) = delete;
+  private:
+    SemaphoreHandle_t m_mutex;
+};
+}
 
 // weak default implementation - can be overridden by user
 __attribute__((weak)) void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S) {
@@ -360,9 +368,10 @@ void AudioBuffer::showStatus() {
 Audio::Audio(uint8_t i2sPort) {
 
     m_f_I2S_init = false;
-    mutex_playAudioData = xSemaphoreCreateMutex();
-    mutex_audioTask = xSemaphoreCreateMutex();
-    mutex_audioTaskIsDecoding = xSemaphoreCreateMutex();
+    mutex_playAudioData = xSemaphoreCreateRecursiveMutex();
+    mutex_audioTask = xSemaphoreCreateRecursiveMutex();
+    mutex_audioTaskIsDecoding = xSemaphoreCreateRecursiveMutex();
+    m_audioTaskStopped = xSemaphoreCreateBinary();
 
     m_i2s_items.i2s_num = i2sPort; // i2s port number
 }
@@ -405,15 +414,20 @@ bool Audio::prepareTlsClient() {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 Audio::~Audio() {
-    stopSong();
-    setDefaults();
-
-    i2s_channel_disable(m_i2s_tx_handle);
-    i2s_del_channel(m_i2s_tx_handle);
     stopAudioTask();
-    vSemaphoreDelete(mutex_playAudioData);
-    vSemaphoreDelete(mutex_audioTask);
-    vSemaphoreDelete(mutex_audioTaskIsDecoding);
+    stopSong();
+    client.stop();
+    clientsecure.stop();
+    if (m_audiofile) m_audiofile.close();
+
+    if (m_i2s_tx_handle) {
+        i2s_channel_disable(m_i2s_tx_handle);
+        i2s_del_channel(m_i2s_tx_handle);
+    }
+    if (m_audioTaskStopped) vSemaphoreDelete(m_audioTaskStopped);
+    if (mutex_playAudioData) vSemaphoreDelete(mutex_playAudioData);
+    if (mutex_audioTask) vSemaphoreDelete(mutex_audioTask);
+    if (mutex_audioTaskIsDecoding) vSemaphoreDelete(mutex_audioTaskIsDecoding);
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::destroy_decoder() {
@@ -3362,15 +3376,16 @@ size_t Audio::process_m3u8_ID3_Header(uint8_t* packet) {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 uint32_t Audio::stopSong() {
+    if (!mutex_audioTask || !mutex_audioTaskIsDecoding) return 0;
+    xSemaphoreTakeRecursive(mutex_audioTask, portMAX_DELAY);
     m_f_lockInBuffer = true; // wait for the decoding to finish
-    uint8_t  maxWait = 0;
     uint32_t currTime = getAudioCurrentTime();
 
-    xSemaphoreTake(mutex_audioTaskIsDecoding, 1 * configTICK_RATE_HZ); // wait for audioTask is ready
+    xSemaphoreTakeRecursive(mutex_audioTaskIsDecoding, portMAX_DELAY);
     {
         if (m_f_running) {
             m_f_running = false;
-            if (m_client->connected()) {
+            if (m_client && m_client->connected()) {
                 if (m_streamType == ST_WEBSTREAM) { info(*this, evt_info, "Closing web stream \"{}\"", m_lastHost.c_get()); }
                 if (m_streamType == ST_WEBFILE) { info(*this, evt_info, "Closing web file \"{}\"", m_lastHost.c_get()); }
                 m_client->stop();
@@ -3381,14 +3396,20 @@ uint32_t Audio::stopSong() {
             }
         }
         destroy_decoder();
+        m_validSamples = 0;
+        m_plCh.count = 0;
+        m_pcmOutput.reset();
+        m_resampler = {};
+        m_reconnectRequested = false;
         m_f_lockInBuffer = false;
     }
-    xSemaphoreGive(mutex_audioTaskIsDecoding);
+    xSemaphoreGiveRecursive(mutex_audioTaskIsDecoding);
+    xSemaphoreGiveRecursive(mutex_audioTask);
     return currTime;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 bool Audio::pauseResume() {
-    xSemaphoreTake(mutex_audioTask, 0.3 * configTICK_RATE_HZ);
+    xSemaphoreTakeRecursive(mutex_audioTask, portMAX_DELAY);
     bool retVal = false;
     if (m_dataMode == AUDIO_LOCALFILE || m_streamType == ST_WEBSTREAM || m_streamType == ST_WEBFILE) {
         m_f_running = !m_f_running;
@@ -3397,9 +3418,11 @@ bool Audio::pauseResume() {
             m_outBuff.clear();
             memset(m_resamplesBuff.get(), 0, m_resamplesBuffSize * sizeof(int16_t)); // Clear SamplesBuffer
             m_validSamples = 0;
+            m_pcmOutput.reset();
+            m_plCh.count = 0;
         }
     }
-    xSemaphoreGive(mutex_audioTask);
+    xSemaphoreGiveRecursive(mutex_audioTask);
     return retVal;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -3523,6 +3546,20 @@ uint32_t Audio::resampleI2Soutput(audiolib::resampler_t& rs, int32_t* input, uin
 void IRAM_ATTR Audio::playChunk() {
     if (m_validSamples == 0) return; // nothing to do
 
+    if (m_f_pcmOutput_init) {
+        if (!m_pcmOutput.pendingFrames()) {
+            const int32_t* samples = m_outBuff.get();
+            if (m_i2s_items.sampleRate != SR_48000) {
+                m_validSamples = resampleI2Soutput(m_resampler, m_outBuff.get(), m_validSamples, m_resamplesBuff.get());
+                samples = m_resamplesBuff.get();
+            }
+            m_pcmOutput.begin(samples, m_validSamples);
+        }
+        m_pcmOutput.drain();
+        m_validSamples = m_pcmOutput.pendingFrames();
+        return;
+    }
+
     bool continueI2S = true;
     m_plCh.i2s_bytesConsumed = 0;
     m_plCh.err = ESP_OK;
@@ -3599,6 +3636,10 @@ i2swrite:
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::loop() {
     get_info();
+    if (m_reconnectRequested.exchange(false)) {
+        reconnecttohost();
+        return;
+    }
     if (!m_f_running) return;
 
     if (m_f_firstLoop) {
@@ -4827,7 +4868,7 @@ void Audio::playAudioData() {
     if (m_streamType == ST_WEBSTREAM || m_playlistFormat == FORMAT_M3U8) isStream = true;
     if (!isFile && !isStream) return;
 
-    xSemaphoreTake(mutex_audioTaskIsDecoding, 1 * configTICK_RATE_HZ);
+    xSemaphoreTakeRecursive(mutex_audioTaskIsDecoding, portMAX_DELAY);
     {
         m_pad.bytesDecoded = 0;
         if (isFile) {
@@ -4890,7 +4931,7 @@ void Audio::playAudioData() {
         }
     }
 exit:
-    xSemaphoreGive(mutex_audioTaskIsDecoding);
+    xSemaphoreGiveRecursive(mutex_audioTaskIsDecoding);
 
     AUDIO_LOG_DEBUG("m_audioDataReadPtr {}, m_audioDataSize {}", m_audioDataReadPtr, m_audioDataSize);
     return;
@@ -5232,6 +5273,7 @@ lastToDo:
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 bool Audio::initializeDecoder() {
+    AudioTaskGuard lock(mutex_audioTask);
     if (m_decoder) {
         AUDIO_LOG_WARN("stopSong first");
         return true;
@@ -5676,11 +5718,13 @@ void Audio::setDecoderItems() {
     if (getBitsPerSample() != 8 && getBitsPerSample() != 16 && getBitsPerSample() != 24 && getBitsPerSample() != 32) {
         AUDIO_LOG_ERROR("Bits per sample must be 8, 16, 24 or 32 found {}", getBitsPerSample());
         stopSong();
+        return;
     }
 
     if (getChannels() != 1 && getChannels() != 2) {
         AUDIO_LOG_ERROR("Num of channels must be 1 or 2, found {}", getChannels());
         stopSong();
+        return;
     }
     showCodecParams();
 }
@@ -5710,7 +5754,8 @@ uint32_t Audio::decodeError(int8_t res, uint8_t* data, int32_t bytesDecoded) {
     if (m_codec == CODEC_MP3) {
         if (res == MP3Decoder::MP3_NEED_RESTART) {
             info(*this, evt_info, "" ANSI_ESC_RED "Network error" ANSI_ESC_RESET "");
-            reconnecttohost();
+            m_reconnectRequested = true;
+            m_f_stream = false;
             return 0;
         }
     }
@@ -6009,6 +6054,9 @@ bool Audio::i2s_config() {
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 bool Audio::setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK) {
 
+    if (m_f_pcmOutput_init) return false;
+    if (!mutex_audioTask || !mutex_audioTaskIsDecoding || !mutex_playAudioData || !m_audioTaskStopped) return false;
+
     i2s_std_gpio_config_t gpio_cfg = {};
     bool                  result = i2s_config();
 
@@ -6071,10 +6119,33 @@ bool Audio::setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK) {
 exit:
 
     calculateVolumeLimits(); // first init, vol = 21, vol_steps = 21
-    startAudioTask();
-
     m_f_I2S_init = result;
+    if (result && !startAudioTask()) m_f_I2S_init = false;
     return m_f_I2S_init;
+}
+
+bool Audio::initPcmOutput(PcmOutputCallback callback) {
+    if (!callback || m_f_I2S_init || m_f_pcmOutput_init) return false;
+    if (!mutex_audioTask || !mutex_audioTaskIsDecoding || !mutex_playAudioData || !m_audioTaskStopped) return false;
+    m_f_psramFound = psramInit();
+    if (!m_f_psramFound) return false;
+
+    m_outBuff.alloc_array(m_outbuffSize, "m_outBuff");
+    m_resamplesBuff.alloc_array(m_resamplesBuffSize, "m_resamplesBuff");
+    m_metadataBuff.alloc(4096 + 1, "m_metadataBuff");
+    m_httpRespHdrBuff.alloc(4096, "m_httpRespHdrBuff");
+    if (!m_outBuff.valid() || !m_resamplesBuff.valid() || !m_metadataBuff.valid() || !m_httpRespHdrBuff.valid()) return false;
+
+    m_pcmOutput.setCallback(std::move(callback));
+    m_output_sr = SR_48000;
+    m_f_pcmOutput_init = true;
+    reconfigI2S();
+    if (!startAudioTask()) {
+        m_f_pcmOutput_init = false;
+        m_pcmOutput.setCallback({});
+        return false;
+    }
+    return true;
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 uint32_t Audio::getFileSize() { // returns the size of webfile or local file
@@ -6330,6 +6401,7 @@ int32_t Audio::audioFileSeek(uint32_t position, size_t len) {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 bool Audio::fsRange(uint32_t range) {
+    AudioTaskGuard lock(mutex_audioTask);
 
     if ((m_dataMode == AUDIO_LOCALFILE) && !m_audiofile) {
         AUDIO_LOG_WARN("{}", "local file not accessibble");
@@ -6341,6 +6413,8 @@ bool Audio::fsRange(uint32_t range) {
     if (range >= (int32_t)endAB) { range = endAB; }
 
     m_validSamples = 0;
+    m_pcmOutput.reset();
+    m_plCh.count = 0;
     m_resumeFilePos = range; // used in processLocalFile()
     return true;
 }
@@ -6425,6 +6499,13 @@ void Audio::setI2SCommFMT_LSB(bool commFMT) {
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::reconfigI2S() {
 
+    if (m_output_sr) {
+        m_resampler = {};
+        m_resampler.phaseStep = ((uint64_t)m_i2s_items.sampleRate << 32) / m_output_sr;
+        m_resampler.g_lpCoeffs = makeButterworthLPF_Q31(m_i2s_items.sampleRate);
+    }
+    if (m_f_pcmOutput_init || !m_i2s_tx_handle) return;
+
     i2s_channel_disable(m_i2s_tx_handle);
 
     if (m_i2s_items.commFMT) {
@@ -6435,11 +6516,6 @@ void Audio::reconfigI2S() {
     i2s_channel_reconfig_std_slot(m_i2s_tx_handle, &m_i2s_std_cfg.slot_cfg);
 
     if (m_output_sr) {
-        m_resampler.phase = 0; // prepare resampler
-        m_resampler.phaseStep = ((uint64_t)m_i2s_items.sampleRate << 32) / m_output_sr;
-        m_resampler.g_lpCoeffs = makeButterworthLPF_Q31(m_i2s_items.sampleRate);
-        m_resampler.lpLeft = {};
-        m_resampler.lpRight = {};
         m_i2s_std_cfg.clk_cfg.sample_rate_hz = m_output_sr;
         AUDIO_LOG_DEBUG("output samplerate is {}", m_i2s_std_cfg.clk_cfg.sample_rate_hz);
     } else {
@@ -6552,6 +6628,7 @@ void Audio::forceMono(bool m) { // #100 mono option
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::setOutputSampleRate(OutputSR_t sr) { //
+    if (m_f_pcmOutput_init) sr = SR_48000;
     if (sr == SR_44100) {
         m_output_sr = SR_44100; // output sr is always 44.1KHz
     } else if (sr == SR_48000) {
@@ -7319,6 +7396,7 @@ bool Audio::readID3V1Tag() {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————-
 int32_t Audio::newInBuffStart(int32_t resumeFilePos) {
+    AudioTaskGuard lock(mutex_audioTask);
 
     if ((m_controlCounter != 100) || (m_resumeFilePos >= (int32_t)m_audioDataStart + m_audioDataSize) || ((m_codec == CODEC_M4A) && !m_stsz_position)) {
         AUDIO_LOG_WARN("timeOffset not possible (1)");
@@ -7338,18 +7416,24 @@ int32_t Audio::newInBuffStart(int32_t resumeFilePos) {
     }
 
     // --- enter critical area ------------------------------------------
-    xSemaphoreTake(mutex_audioTaskIsDecoding, 1 * configTICK_RATE_HZ);
+    xSemaphoreTakeRecursive(mutex_audioTaskIsDecoding, portMAX_DELAY);
     m_f_lockInBuffer = true;
 
     // ------- prepare InBuff ------
+    m_validSamples = 0;
+    m_pcmOutput.reset();
+    m_plCh.count = 0;
     m_f_allDataReceived = false;
     audioFileSeek(resumeFilePos);
     InBuff.reset();
     int32_t bw = audioFileRead(InBuff.getWritePtr(), buffFillValue, 3000);
     if (bw == buffFillValue)
         InBuff.bytesWritten(bw);
-    else
+    else {
+        m_f_lockInBuffer = false;
+        xSemaphoreGiveRecursive(mutex_audioTaskIsDecoding);
         return -1;
+    }
 
     int32_t offset = 0;
     int32_t newFilePos = resumeFilePos;
@@ -7362,7 +7446,7 @@ int32_t Audio::newInBuffStart(int32_t resumeFilePos) {
         AUDIO_LOG_ERROR("timeOffset not possible (3)");
         InBuff.bytesWasRead(0);
         m_f_lockInBuffer = false;
-        xSemaphoreGive(mutex_audioTaskIsDecoding);
+        xSemaphoreGiveRecursive(mutex_audioTaskIsDecoding);
         stopSong();
         return -1;
     };
@@ -7410,7 +7494,7 @@ int32_t Audio::newInBuffStart(int32_t resumeFilePos) {
     InBuff.bytesWasRead(offset);
     m_audioDataReadPtr = (resumeFilePos + offset) - m_audioDataStart;
     m_f_lockInBuffer = false;
-    xSemaphoreGive(mutex_audioTaskIsDecoding);
+    xSemaphoreGiveRecursive(mutex_audioTaskIsDecoding);
 
     return newFilePos;
 }
@@ -7701,28 +7785,36 @@ const char* Audio::getVersion() {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 bool Audio::get_info() {
-    if (m_info_queue.e.size() == 0) return false;
-    msg_t i = {0};
-    while (m_info_queue.e.size()) {
-        ps_ptr<char> msg = m_info_queue.msg.back();
-        i.msg = msg.c_get();
-        i.e = (event_t)m_info_queue.e.back();
-        ps_ptr<char> evtstr = m_info_queue.s.back();
-        i.s = evtstr.c_get();
-        i.arg1 = m_info_queue.arg1.back();
-        i.arg2 = m_info_queue.arg2.back();
-        i.i2s_num = m_i2s_items.i2s_num;
-        i.vec = m_info_queue.vec.back();
-
-        m_info_queue.msg.pop_back();
-        m_info_queue.e.pop_back();
-        m_info_queue.s.pop_back();
-        m_info_queue.arg1.pop_back();
-        m_info_queue.arg2.pop_back();
-        m_info_queue.vec.pop_back();
-        audio_info_callback(i);
+    bool delivered = false;
+    size_t budget = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_info);
+        budget = m_info_queue.drainBudget();
     }
-    return true;
+    for (size_t count = 0; count < budget; ++count) {
+        msg_t i = {0};
+        InfoEvent event;
+        std::function<void(msg_t)> callback;
+        {
+            std::lock_guard<std::mutex> lock(mutex_info);
+            if (!m_info_queue.tryPop(event)) break;
+            i.msg = event.message.c_get();
+            i.e = event.type;
+            i.s = event.tag;
+            i.arg1 = event.arg1;
+            i.i2s_num = m_i2s_items.i2s_num;
+            i.vec = std::move(event.values);
+            callback = m_infoCallback ? m_infoCallback : audio_info_callback;
+        }
+        if (callback) callback(i);
+        delivered = true;
+    }
+    return delivered;
+}
+
+void Audio::setInfoCallback(std::function<void(msg_t)> callback) {
+    std::lock_guard<std::mutex> lock(mutex_info);
+    m_infoCallback = std::move(callback);
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void Audio::trim(char* str) {
@@ -7911,30 +8003,29 @@ ps_ptr<char> Audio::urlencode(const char* str, bool spacesOnly) {
 void Audio::setAudioTaskCore(uint8_t coreID) { // Recommendation:If the ARDUINO RUNNING CORE is 1, the audio task should be core 0 or vice versa
     if (coreID > 1) return;
     stopAudioTask();
-    xSemaphoreTake(mutex_audioTask, 0.3 * configTICK_RATE_HZ);
+    xSemaphoreTakeRecursive(mutex_audioTask, portMAX_DELAY);
     m_audioTaskCoreId = coreID;
-    xSemaphoreGive(mutex_audioTask);
+    xSemaphoreGiveRecursive(mutex_audioTask);
     startAudioTask();
 }
 
-void Audio::startAudioTask() {
+bool Audio::startAudioTask() {
 
     if (m_f_audioTaskIsRunning) {
         AUDIO_LOG_DEBUG("audio task is already running.");
-        return;
+        return true;
     }
     AUDIO_LOG_INFO("start audio task.");
+    if (!m_audioTaskStopped) return false;
+    xSemaphoreTake(m_audioTaskStopped, 0);
     m_f_audioTaskIsRunning = true;
-
-    m_audioTaskHandle = xTaskCreateStaticPinnedToCore(&Audio::audioTaskWrapper, /* Function to implement the task */
-                                                      "PeriodicTask",           /* Name of the task */
-                                                      AUDIO_STACK_SIZE,         /* Stack size in words */
-                                                      this,                     /* Task input parameter */
-                                                      2,                        /* Priority of the task */
-                                                      xAudioStack,              /* Task stack */
-                                                      &xAudioTaskBuffer,        /* Memory for the task's control block */
-                                                      m_audioTaskCoreId         /* Core where the task should run */
-    );
+    if (xTaskCreatePinnedToCore(&Audio::audioTaskWrapper, "PeriodicTask", AUDIO_STACK_SIZE, this, 2,
+                               &m_audioTaskHandle, m_audioTaskCoreId) != pdPASS) {
+        m_f_audioTaskIsRunning = false;
+        m_audioTaskHandle = nullptr;
+        return false;
+    }
+    return true;
 }
 
 void Audio::stopAudioTask() {
@@ -7943,13 +8034,11 @@ void Audio::stopAudioTask() {
         return;
     }
     AUDIO_LOG_INFO("stop audio task.");
-    xSemaphoreTake(mutex_audioTask, 0.3 * configTICK_RATE_HZ);
     m_f_audioTaskIsRunning = false;
     if (m_audioTaskHandle != nullptr) {
-        vTaskDelete(m_audioTaskHandle);
+        xSemaphoreTake(m_audioTaskStopped, portMAX_DELAY);
         m_audioTaskHandle = nullptr;
     }
-    xSemaphoreGive(mutex_audioTask);
 }
 
 void Audio::audioTaskWrapper(void* param) {
@@ -7960,29 +8049,32 @@ void Audio::audioTaskWrapper(void* param) {
 void Audio::audioTask() {
     while (m_f_audioTaskIsRunning) {
         vTaskDelay(1 / portTICK_PERIOD_MS); // periodically every x ms
-        if (m_f_I2S_init) performAudioTask();
+        if (m_f_I2S_init || m_f_pcmOutput_init) performAudioTask();
     }
+    xSemaphoreGive(m_audioTaskStopped);
     vTaskDelete(nullptr); // Delete this task
 }
 
 void Audio::performAudioTask() {
+    xSemaphoreTakeRecursive(mutex_audioTask, portMAX_DELAY);
+    const bool idle = !m_decoder;
     if (m_decoder) {
-        xSemaphoreTake(mutex_audioTask, 0.3 * configTICK_RATE_HZ);
         playAudioData();
-        xSemaphoreGive(mutex_audioTask);
-        gain_ramp();
-        return;
+        if (!m_f_pcmOutput_init) gain_ramp();
     } else {
         if(m_validSamples) playChunk(); // empty I2S DMA
-        int32_t c[2] = {0};
-        calculateVUlevel(c);
-        gain_ramp();
-        vTaskDelay(20);
-        return;
+        if (!m_f_pcmOutput_init) {
+            int32_t c[2] = {0};
+            calculateVUlevel(c);
+            gain_ramp();
+        }
     }
+    xSemaphoreGiveRecursive(mutex_audioTask);
+    if (idle) vTaskDelay(20);
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 uint32_t Audio::getHighWatermark() {
+    if (!m_audioTaskHandle) return 0;
     UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(m_audioTaskHandle);
     return highWaterMark; // dwords
 }

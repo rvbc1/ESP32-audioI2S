@@ -42,3 +42,8 @@ The fixture was generated from silence using:
 ```sh
 ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 0.1 -c:a aac -b:a 64000 -f adts tests/fixtures/silence-stereo-44100.aac
 ```
+
+The PCM test checks real output delivery with zero/partial consumption, retry,
+independent sinks, reset and an invalid over-reporting consumer. The event queue
+test floods 10000 move-only entries, verifies bounded FIFO ownership and checks
+that continuous producer replenishment cannot extend the fixed dispatch budget.

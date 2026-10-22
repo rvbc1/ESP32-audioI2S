@@ -67,6 +67,49 @@ For a private server, call `audio.setCACert(pem)` before connecting. The method 
 
 Once a stream uses HTTPS, HTTP redirects, HLS playlists, segments, range requests, and internal reconnects cannot downgrade that stream to HTTP. Protocol-relative URLs preserve the current scheme. A new explicit `connecttohost("http://...")` remains available for legacy HTTP stations. Basic authentication on reconnect and the buffering APIs described above remain supported.
 
+## Independent PCM output
+
+`ESP32_AUDIO_I2S_PCM_OUTPUT` identifies the optional PCM output API. Initialize it
+instead of calling `setPinout()` when the application owns the output device:
+
+```cpp
+Audio source;
+source.setInfoCallback([](Audio::msg_t message) {
+    // Handle this source's events. Copy message strings if retaining them.
+});
+bool ready = source.initPcmOutput([](const int32_t* samples, size_t frames) -> size_t {
+    // Copy up to `frames` into an application-owned queue; return frames copied.
+    return copyToOutputQueue(samples, frames);
+});
+```
+
+The callback receives interleaved stereo `int32_t` PCM at 48 kHz before volume,
+gain, EQ and mono processing. The legacy global PCM hooks are skipped in this
+mode. A zero or partial return preserves the remaining frames for a later call;
+the pointer is valid only during the callback. The callback runs on the source's
+decoder task and must return promptly: it must neither block nor call `Audio`
+methods. `isPcmOutputReady()` reports successful initialization and a running
+decoder task; it does not mean that a stream has produced PCM yet.
+
+Each `Audio` instance owns its decoder task and pending PCM. Two PCM instances
+can feed a mixer without allocating or controlling I2S channels, VU or spectrum
+buffers. The application must provide output pacing, queue capacity, mixing and
+the physical I2S owner. Normal `setPinout()` playback remains available.
+
+Use one control task per instance for `loop()`, connection, stop and destruction.
+Control methods are not a general concurrent API. `stopSong()` waits for any
+in-flight PCM callback; do not hold an application queue lock needed by that
+callback while stopping or deleting a source. Destruction joins the decoder
+task. Concurrent `stopSong()`/destruction from multiple owners is unsupported.
+
+`setInfoCallback()` selects an instance callback, falling back to the legacy
+global callback when unset. Stream events are queued per instance, with at most
+32 pending events and eight deliveries per `loop()`. Excess events, text over
+4096 bytes and image descriptors over 1024 integers are rejected. Callbacks run
+outside the queue lock. Low-level static decoder logging still uses the global
+logging callback. Host regression commands and limitations are in
+[tests/README.md](tests/README.md).
+
 You can find more examples here: https://github.com/schreibfaul1/ESP32-audioI2S/tree/master/examples
 
 ````c++
