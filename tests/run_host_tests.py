@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -71,6 +72,8 @@ def run_tests(repo, build, ref, expect_leak, compiler):
                        check=True, env=environment)
 
     if not expect_leak:
+        subprocess.run([sys.executable, str(repo / "tests/run_mp3_clz_test.py"),
+                        "--build-dir", str(build / "mp3-clz"), "--cxx", compiler], check=True)
         for name in ("pcm_output", "bounded_queue"):
             testcase = repo / f"tests/{name}_test.cpp"
             if not testcase.exists():

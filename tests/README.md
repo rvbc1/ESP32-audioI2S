@@ -47,3 +47,6 @@ The PCM test checks real output delivery with zero/partial consumption, retry,
 independent sinks, reset and an invalid over-reporting consumer. The event queue
 test floods 10000 move-only entries, verifies bounded FIFO ownership and checks
 that continuous producer replenishment cannot extend the fixed dispatch budget.
+
+The suite also runs the [MP3 leading-zero regression](MP3_CLZ.md) with full
+ASAN/UBSAN and no arithmetic sanitizer exclusions.
