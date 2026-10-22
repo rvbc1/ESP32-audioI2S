@@ -175,7 +175,7 @@ int32_t AACDecoder::decode(uint8_t* inbuf, int32_t* bytesLeft, int32_t* outbuf) 
         }
 
         if (m_aacChannels == 2) {
-            for (int i = 0; i < m_validSamples * 2; i++) { outbuf[i] = m_out16[i] << 16; }
+            for (int i = 0; i < m_validSamples; i++) { outbuf[i] = m_out16[i] << 16; }
         }
     }
     return err;

@@ -31,3 +31,14 @@ python3 tests/run_host_tests.py --source-ref <pre-fix-commit> --expect-leak
 That control must find 100 allocations of each 512-, 4096- and 2048-byte table
 (665600 bytes total), then discards the intentionally leaked tables. The
 fixed-point control must remain leak-free because its tables are static.
+
+The AAC output-bound test compiles the real wrapper and decodes a small stereo
+AAC-LC silence fixture through two interleaved decoder instances. A sentinel
+after the reported scalar-sample count catches writes beyond produced output.
+Its overlay uses the real `Decoder` interface with unused base fallback methods
+and platform logging stubbed; all AAC wrapper and FAAD implementation is real.
+The fixture was generated from silence using:
+
+```sh
+ffmpeg -f lavfi -i anullsrc=r=44100:cl=stereo -t 0.1 -c:a aac -b:a 64000 -f adts tests/fixtures/silence-stereo-44100.aac
+```

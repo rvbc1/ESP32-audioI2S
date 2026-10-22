@@ -35,6 +35,18 @@ def run_tests(repo, build, ref, expect_leak, compiler):
         (faad / path.name).write_bytes(data)
     (overlay / "psram_unique_ptr.hpp").write_bytes(source_bytes(repo, "src/psram_unique_ptr.hpp", ref))
     shutil.copyfile(host / "Audio.h", overlay / "Audio.h")
+    wrapper_test = repo / "tests/aac_output_bound_test.cpp"
+    if wrapper_test.exists() and not expect_leak:
+        audio_header = source_bytes(repo, "src/Audio.h", ref).decode()
+        start = audio_header.index("class Decoder {")
+        end = audio_header.index("\n};", start) + len("\n};")
+        with (overlay / "Audio.h").open("a") as output:
+            output.write("\n" + audio_header[start:end] + "\n")
+            output.write("inline const char* Decoder::getStreamTitle() { return nullptr; }\n")
+            output.write("inline const char* Decoder::whoIsIt() { return nullptr; }\n")
+        for name in ("aac_decoder.h", "aac_decoder.cpp"):
+            relative = f"src/aac_decoder/{name}"
+            (overlay / "aac_decoder" / name).write_bytes(source_bytes(repo, relative, ref))
 
     common = [compiler, "-std=c++20", "-O1", "-g", "-fno-omit-frame-pointer",
               "-fsanitize=address,undefined", "-fdelayed-template-parsing",
@@ -49,6 +61,13 @@ def run_tests(repo, build, ref, expect_leak, compiler):
                     str(repo / "tests/aac_decoder_lifecycle_test.cpp"), "-o", str(executable)]
         subprocess.run(command, check=True)
         subprocess.run([str(executable)] + (["--expect-leak"] if expect_leak else []),
+                       check=True, env=environment)
+
+    if wrapper_test.exists() and not expect_leak:
+        executable = build / "aac-output-bound"
+        subprocess.run(common + [str(faad / "neaacdec.cpp"), str(overlay / "aac_decoder/aac_decoder.cpp"),
+                                 str(host / "Allocations.cpp"), str(wrapper_test), "-o", str(executable)], check=True)
+        subprocess.run([str(executable), str(repo / "tests/fixtures/silence-stereo-44100.aac")],
                        check=True, env=environment)
 
 def main():
