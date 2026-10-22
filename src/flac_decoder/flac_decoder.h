@@ -188,6 +188,7 @@ class FlacDecoder : public Decoder {
 
     uint64_t        m_flac_bitBuffer = 0;
     uint32_t        m_flacBitrate = 0;
+    int32_t         m_frameBytes = 0;
     uint32_t        m_flacBlockPicLenUntilFrameEnd = 0;
     uint32_t        m_flacCurrentFilePos = 0;
     uint32_t        m_flacBlockPicPos = 0;

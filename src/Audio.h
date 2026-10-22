@@ -5,11 +5,14 @@
 
 #pragma once
 #define ESP32_AUDIO_I2S_VERIFIED_TLS 1
+#define ESP32_AUDIO_I2S_PCM_OUTPUT 1
 #pragma GCC optimize("Ofast")
 #include "audiolib_structs.hpp"
 #include "esp_arduino_version.h"
 #include "esp_dsp.h"
 #include "psram_unique_ptr.hpp"
+#include "PcmOutput.h"
+#include "BoundedQueue.h"
 #include <Arduino.h>
 #include <FFat.h>
 #include <FS.h>
@@ -144,6 +147,8 @@ class Audio {
         std::vector<uint32_t> vec = {}; // apic [pos, len, pos, len, pos, len, ....]
     } msg_t;
     inline static std::function<void(msg_t i)> audio_info_callback;
+    using PcmOutputCallback = audiolib::PcmOutput::Callback;
+    void setInfoCallback(std::function<void(msg_t)> callback);
     using VolumeCurveFn = std::function<float(float t)>;
     // -------------------------------------------------------------------
     typedef enum : uint32_t { SR_ORIGIN = 0, SR_44100 = 44100, SR_48000 = 48000 } OutputSR_t;
@@ -158,6 +163,9 @@ class Audio {
     bool             setAudioPlayTime(uint16_t sec);
     bool             setTimeOffset(int sec);
     bool             setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK = I2S_GPIO_UNUSED);
+    // Callback copies stereo 48 kHz int32 frames and returns the number accepted; it must not block or call Audio methods.
+    bool             initPcmOutput(PcmOutputCallback callback);
+    bool             isPcmOutputReady() const { return m_f_pcmOutput_init && m_f_audioTaskIsRunning.load(); }
     bool             pauseResume();
     bool             isRunning() { return m_f_running; }
     bool             setInputBufferSize(size_t bytes);
@@ -276,7 +284,7 @@ class Audio {
     uint32_t getHighWatermark();
 
   private:
-    void        startAudioTask(); // starts a task for decode and play
+    bool        startAudioTask(); // starts a task for decode and play
     void        stopAudioTask();  // stops task for audio
     static void audioTaskWrapper(void* param);
     void        audioTask();
@@ -395,7 +403,11 @@ class Audio {
     SemaphoreHandle_t mutex_playAudioData;
     SemaphoreHandle_t mutex_audioTask;
     SemaphoreHandle_t mutex_audioTaskIsDecoding;
-    TaskHandle_t      m_audioTaskHandle = nullptr;
+    TaskHandle_t              m_audioTaskHandle = nullptr;
+    SemaphoreHandle_t         m_audioTaskStopped;
+    audiolib::PcmOutput        m_pcmOutput;
+    std::function<void(msg_t)> m_infoCallback;
+    bool                      m_f_pcmOutput_init = false;
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
@@ -500,7 +512,8 @@ class Audio {
     bool           m_f_m4aID3dataAreRead = false;   // has the m4a-ID3data already been read?
     bool           m_f_psramFound = false;          // set in constructor, result of psramInit()
     bool           m_f_timeout = false;             //
-    bool           m_f_audioTaskIsRunning = false;  //
+    std::atomic<bool> m_f_audioTaskIsRunning{false};
+    std::atomic<bool> m_reconnectRequested{false};
     bool           m_f_allDataReceived = false;     //
     bool           m_f_stream = false;              // stream ready for output?
     bool           m_f_decode_ready = false;        // if true data for decode are ready
@@ -555,7 +568,14 @@ class Audio {
     audiolib::fft_items_t  m_fft_items;
     audiolib::i2s_items_t  m_i2s_items;
     audiolib::resampler_t  m_resampler;
-    audiolib::info_queue_t m_info_queue;
+    struct InfoEvent {
+        ps_ptr<char> message;
+        const char* tag = nullptr;
+        event_t type = evt_info;
+        int32_t arg1 = 0;
+        std::vector<uint32_t> values;
+    };
+    audiolib::BoundedQueue<InfoEvent, 32, 8> m_info_queue;
     audiolib::icy_items_t  m_icy_items;
 
     // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
@@ -563,11 +583,12 @@ class Audio {
     template <typename... Args> static bool info(Audio& instance, event_t e, const char* fmt, Args&&... args) {
         std::lock_guard<std::mutex> lock(instance.mutex_info);
         if (!fmt) return false;
-        if (!audio_info_callback) return false;
+        if (!instance.m_infoCallback && !audio_info_callback) return false;
+        if (static_cast<size_t>(e) >= eventStr.size() || instance.m_info_queue.full()) return false;
 
         ps_ptr<char> result;
         result.assignf(fmt, std::forward<Args>(args)...);
-        if (!result.get()) return false;
+        if (!result.get() || std::strlen(result.c_get()) > 4096) return false;
 
         auto extract_last_number = [](std::string_view s) -> std::optional<int32_t> {
             auto is_space = [](char c) { return std::isspace(static_cast<unsigned char>(c)); };
@@ -597,38 +618,28 @@ class Audio {
             return std::nullopt;
         };
 
-        std::vector<uint32_t> v;
-        v.push_back(0);
-        instance.m_info_queue.msg.emplace_front(result);
-        instance.m_info_queue.s.emplace_front(eventStr[e]);
-        instance.m_info_queue.arg1.emplace_front(extract_last_number(result.c_get()).value_or(0));
-        instance.m_info_queue.arg2.emplace_front(0);
-        instance.m_info_queue.vec.emplace_front(v);
-        instance.m_info_queue.e.emplace_front((uint8_t)e);
-        result.reset();
-        return true;
+        InfoEvent event;
+        event.arg1 = extract_last_number(result.c_get()).value_or(0);
+        event.message = std::move(result);
+        event.tag = eventStr[e];
+        event.type = e;
+        event.values.push_back(0);
+        return instance.m_info_queue.tryPush(std::move(event));
     }
 
     static bool info(Audio& instance, event_t e, std::vector<uint32_t>& v) {
-        if (!audio_info_callback) return false;
         std::lock_guard<std::mutex> lock(instance.mutex_info); // lock mutex
+        if (!instance.m_infoCallback && !audio_info_callback) return false;
+        if (static_cast<size_t>(e) >= eventStr.size() || instance.m_info_queue.full() || v.empty() || v.size() > 1024) return false;
         ps_ptr<char>                apic;
         apic.assignf("APIC found at pos {}", v[0]);
-        // msg_t i;
-        // i.msg = apic.c_get();
-        // i.e = e;
-        // i.s = eventStr[e];
-        // i.i2s_num = instance.m_i2s_items.i2s_num;
-        // i.vec = v;
-        // audio_info_callback(i);
-
-        instance.m_info_queue.msg.emplace_front(apic);
-        instance.m_info_queue.s.emplace_front(eventStr[e]);
-        instance.m_info_queue.arg1.emplace_front(0);
-        instance.m_info_queue.arg2.emplace_front(0);
-        instance.m_info_queue.vec.emplace_front(v);
-        instance.m_info_queue.e.emplace_front((uint8_t)e);
-        return true;
+        if (!apic.get()) return false;
+        InfoEvent event;
+        event.message = std::move(apic);
+        event.tag = eventStr[e];
+        event.type = e;
+        event.values = v;
+        return instance.m_info_queue.tryPush(std::move(event));
     }
     //----------------------------------------------------------------------------------------------------------------------
 

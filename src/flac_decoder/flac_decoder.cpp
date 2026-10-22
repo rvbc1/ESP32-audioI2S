@@ -52,6 +52,7 @@ bool FlacDecoder::init() {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void FlacDecoder::clear() {
+    m_frameBytes = 0;
     FLACFrameHeader.zero_mem();
     FLACMetadataBlock.zero_mem();
 
@@ -64,6 +65,7 @@ void FlacDecoder::clear() {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void FlacDecoder::reset() {
+    m_frameBytes = 0;
     FLACFrameHeader.reset();
     FLACMetadataBlock.reset();
     m_flacStreamTitle.reset();
@@ -78,6 +80,7 @@ void FlacDecoder::reset() {
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 void FlacDecoder::setDefaults() {
+    m_frameBytes = 0;
     coefs.clear();
     m_flacSegmTableVec.clear();
     m_flacBlockPicItem.clear();
@@ -846,7 +849,6 @@ int32_t FlacDecoder::decode(uint8_t* inbuf, int32_t* bytesLeft, int32_t* outbuf)
 int8_t FlacDecoder::decodeNative(uint8_t* inbuf, int32_t* bytesLeft, int32_t* outbuf) {
 
     int32_t        bl = *bytesLeft;
-    static int32_t sbl = 0;
 
     if (m_flacStatus != OUT_SAMPLES) {
         m_rIndex = 0;
@@ -857,7 +859,7 @@ int8_t FlacDecoder::decodeNative(uint8_t* inbuf, int32_t* bytesLeft, int32_t* ou
         int32_t ret = decodeFrame(inbuf, bytesLeft);
         if (ret != 0) return ret;
         if (*bytesLeft < FLAC_MAX_BLOCKSIZE) return FLAC_DECODE_FRAMES_LOOP; // need more data
-        sbl += bl - *bytesLeft;
+        m_frameBytes += bl - *bytesLeft;
     }
 
     if (m_flacStatus == DECODE_SUBFRAMES) {
@@ -865,7 +867,7 @@ int8_t FlacDecoder::decodeNative(uint8_t* inbuf, int32_t* bytesLeft, int32_t* ou
         int32_t ret = decodeSubframes(bytesLeft);
         if (ret != 0) return ret;
         m_flacStatus = OUT_SAMPLES;
-        sbl += bl - *bytesLeft;
+        m_frameBytes += bl - *bytesLeft;
     }
 
     if (m_flacStatus == OUT_SAMPLES) { // Write the decoded samples
@@ -928,9 +930,9 @@ int8_t FlacDecoder::decodeNative(uint8_t* inbuf, int32_t* bytesLeft, int32_t* ou
         }
 
         m_offset += blockSize;
-        if (sbl > 0) {
-            m_flacCompressionRatio = (float)((m_flacValidSamples * 2) * FLACMetadataBlock->numChannels) / sbl; // valid samples are 16 bit
-            sbl = 0;
+        if (m_frameBytes > 0) {
+            m_flacCompressionRatio = (float)((m_flacValidSamples * 2) * FLACMetadataBlock->numChannels) / m_frameBytes; // valid samples are 16 bit
+            m_frameBytes = 0;
             m_flacBitrate = FLACMetadataBlock->sampleRate * FLACMetadataBlock->bitsPerSample * FLACMetadataBlock->numChannels;
             m_flacBitrate /= m_flacCompressionRatio;
             //      FLAC_LOG_INFO("s_flacBitrate {}, m_flacCompressionRatio {}, FLACMetadataBlock->sampleRate {} ", m_flacBitrate, m_flacCompressionRatio, FLACMetadataBlock->sampleRate);
