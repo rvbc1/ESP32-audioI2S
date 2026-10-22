@@ -59,6 +59,14 @@ audio.settings.BUFFER_PRELOAD_TIMEOUT_MS = 45000;
 
 The initial threshold can be smaller for a fast first start while the ring buffer continues filling in the background. When the decoder exhausts the input data, playback waits for `BUFFER_THRESHOLD_WEBSTREAM` before it resumes. Setting either initial option to `0` makes it inherit the corresponding rebuffer option, preserving the previous behavior. `isBuffering()`, `inBufferFilled()`, `getInBufferSize()` and `getRebufferCount()` expose the current state for diagnostics. A rebuffer threshold of `0` keeps the legacy continuous-stream behavior.
 
+## HTTPS verification
+
+HTTPS connections verify the server certificate with the ESP-IDF public CA bundle when `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE` is enabled. Set the device wall clock before connecting; an unset clock causes HTTPS to fail. Certificate validity dates and the hostname are checked by the TLS stack.
+
+For a private server, call `audio.setCACert(pem)` before connecting. The method copies the PEM into library-owned memory and stops current playback; it returns `false` if allocation fails. `audio.setCACert(nullptr)` restores the public bundle. Without a configured bundle or a custom CA, HTTPS fails closed.
+
+Once a stream uses HTTPS, HTTP redirects, HLS playlists, segments, range requests, and internal reconnects cannot downgrade that stream to HTTP. Protocol-relative URLs preserve the current scheme. A new explicit `connecttohost("http://...")` remains available for legacy HTTP stations. Basic authentication on reconnect and the buffering APIs described above remain supported.
+
 You can find more examples here: https://github.com/schreibfaul1/ESP32-audioI2S/tree/master/examples
 
 ````c++

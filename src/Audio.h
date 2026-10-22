@@ -4,6 +4,7 @@
  */
 
 #pragma once
+#define ESP32_AUDIO_I2S_VERIFIED_TLS 1
 #pragma GCC optimize("Ofast")
 #include "audiolib_structs.hpp"
 #include "esp_arduino_version.h"
@@ -153,6 +154,7 @@ class Audio {
     bool             connecttospeech(const char* speech, const char* lang);
     bool             connecttoFS(fs::FS& fs, const char* path, int32_t fileStartTime = -1);
     void             setConnectionTimeout(uint16_t timeout_ms, uint16_t timeout_ms_ssl);
+    bool             setCACert(const char* certificate);
     bool             setAudioPlayTime(uint16_t sec);
     bool             setTimeOffset(int sec);
     bool             setPinout(uint8_t BCLK, uint8_t LRC, uint8_t DOUT, int8_t MCLK = I2S_GPIO_UNUSED);
@@ -212,6 +214,7 @@ class Audio {
     void                     initInBuff();
     bool                     httpPrint(const char* host);
     bool                     httpRange(uint32_t range, uint32_t length = UINT32_MAX);
+    bool                     prepareTlsClient();
     void                     processLocalFile();
     void                     processWebStream();
     void                     processWebFile();
@@ -386,6 +389,8 @@ class Audio {
     NetworkClient       client;
     NetworkClientSecure clientsecure;
     NetworkClient*      m_client = nullptr;
+    ps_ptr<char>        m_caCertificate;
+    bool                m_requireTls = false;
 
     SemaphoreHandle_t mutex_playAudioData;
     SemaphoreHandle_t mutex_audioTask;

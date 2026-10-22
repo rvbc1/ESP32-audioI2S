@@ -16,6 +16,7 @@ char audioI2SVers[] = "\
 *****************************************************************************************************************************************************/
 
 #include "Audio.h"
+#include "StreamTransportSecurity.h"
 #include "aac_decoder/aac_decoder.h"
 #include "flac_decoder/flac_decoder.h"
 #include "mp3_decoder/mp3_decoder.h"
@@ -23,6 +24,13 @@ char audioI2SVers[] = "\
 #include "psram_unique_ptr.hpp"
 #include "vorbis_decoder/vorbis_decoder.h"
 #include "wav_decoder/wav_decoder.h"
+
+#include <ctime>
+
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+extern const uint8_t audioCertificateBundleStart[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t audioCertificateBundleEnd[] asm("_binary_x509_crt_bundle_end");
+#endif
 
 // constants
 constexpr size_t m_frameSizeWav = 4096;
@@ -356,8 +364,44 @@ Audio::Audio(uint8_t i2sPort) {
     mutex_audioTask = xSemaphoreCreateMutex();
     mutex_audioTaskIsDecoding = xSemaphoreCreateMutex();
 
-    clientsecure.setInsecure();
     m_i2s_items.i2s_num = i2sPort; // i2s port number
+}
+
+bool Audio::setCACert(const char* certificate) {
+    ps_ptr<char> copy;
+    if (certificate && certificate[0]) {
+        copy.assign(certificate);
+        if (!copy.valid()) return false;
+    }
+    stopSong();
+    clientsecure.stop();
+    clientsecure = NetworkClientSecure();
+    m_caCertificate = std::move(copy);
+    return true;
+}
+
+bool Audio::prepareTlsClient() {
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+    constexpr bool hasCertificateBundle = true;
+#else
+    constexpr bool hasCertificateBundle = false;
+#endif
+    if (!audiolib::StreamTransportSecurity::canConnectTls(static_cast<int64_t>(std::time(nullptr)), m_caCertificate.valid(), hasCertificateBundle)) {
+        AUDIO_LOG_ERROR("TLS requires a valid wall clock and a trusted CA");
+        return false;
+    }
+    clientsecure = NetworkClientSecure();
+    clientsecure.setTimeout(m_timeout_ms_ssl);
+    if (m_caCertificate.valid()) {
+        clientsecure.setCACert(m_caCertificate.get());
+        return true;
+    }
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+    clientsecure.setCACertBundle(audioCertificateBundleStart, audioCertificateBundleEnd - audioCertificateBundleStart);
+    return true;
+#else
+    return false;
+#endif
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 Audio::~Audio() {
@@ -549,6 +593,7 @@ bool Audio::openai_speech(const String& api_key, const String& model, const Stri
 
     setDefaults();
     m_f_ssl = true;
+    m_requireTls = true;
 
     m_speechtxt.assign(input.c_str());
 
@@ -615,6 +660,12 @@ bool Audio::openai_speech(const String& api_key, const String& model, const Stri
     bool res = true;
     int  port = 443;
     m_client = static_cast<NetworkClientSecure*>(&clientsecure);
+
+    if (!prepareTlsClient()) {
+        stopSong();
+        xSemaphoreGiveRecursive(mutex_playAudioData);
+        return false;
+    }
 
     uint32_t t = millis();
     info(*this, evt_info, "Connect to: \"{}\"", host.get());
@@ -753,6 +804,7 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
     //                                                     |<-----------------------------path------------------------------------>......
 
     m_f_ssl = dismantledHost.ssl;
+    m_requireTls = m_f_ssl;
     port = dismantledHost.port;
     hwoe = dismantledHost.hwoe.c_get();
     rqh_host = dismantledHost.rqh_host.c_get();
@@ -794,6 +846,11 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
     if (m_f_ssl) {
         m_client = static_cast<NetworkClientSecure*>(&clientsecure);
         if (port == 80) port = 443;
+        if (!prepareTlsClient()) {
+            stopSong();
+            xSemaphoreGiveRecursive(mutex_playAudioData);
+            return false;
+        }
     } else {
         m_client = static_cast<NetworkClient*>(&client);
     }
@@ -853,6 +910,11 @@ bool Audio::reconnecttohost() {
         AUDIO_LOG_ERROR("m_lastHost is empty");
         return false;
     }
+    if (!audiolib::StreamTransportSecurity::canFollow(m_requireTls, m_lastHost.get())) {
+        AUDIO_LOG_ERROR("Refusing HTTPS to HTTP reconnect downgrade");
+        stopSong();
+        return false;
+    }
 
     // Credentials must never be forwarded after another API changes m_lastHost.
     const bool useStoredAuth = m_lastHostAuthUrl.valid() && m_lastHostAuthUser.valid() && m_lastHostAuthPassword.valid() &&
@@ -882,6 +944,17 @@ bool Audio::httpPrint(const char* host) {
     ps_ptr<char> cur_hwoe;     // m_currenthost without extension
 
     c_host.trim();
+    const auto resolved = audiolib::StreamTransportSecurity::resolveUrl(m_currentHost.valid() ? m_currentHost.get() : "", c_host.get());
+    if (!audiolib::StreamTransportSecurity::canFollow(m_requireTls, resolved)) {
+        AUDIO_LOG_ERROR("Refusing invalid stream URL or HTTPS to HTTP downgrade");
+        stopSong();
+        return false;
+    }
+    c_host.assign(resolved.c_str());
+    if (!c_host.valid()) {
+        stopSong();
+        return false;
+    }
     auto dismantledHost = dismantle_host(c_host.get());
 
     //  https://edge.live.mp3.mdn.newmedia.nacamar.net:8000/ps-charivariwb/livestream.mp3;?user=ps-charivariwb;&pwd=ps-charivariwb-------
@@ -892,6 +965,7 @@ bool Audio::httpPrint(const char* host) {
     //                                                     |<-----------------------------path------------------------------------------->
 
     m_f_ssl = dismantledHost.ssl;
+    m_requireTls = m_requireTls || m_f_ssl;
     port = dismantledHost.port;
     hwoe = dismantledHost.hwoe;
     rqh_host = dismantledHost.rqh_host;
@@ -906,7 +980,7 @@ bool Audio::httpPrint(const char* host) {
     cur_hwoe = dismantledLastHost.hwoe;
 
     bool f_equal = true;
-    if (hwoe == cur_hwoe && port == dismantledLastHost.port) {
+    if (hwoe == cur_hwoe && port == dismantledLastHost.port && dismantledHost.ssl == dismantledLastHost.ssl) {
         f_equal = true;
     } else {
         f_equal = false;
@@ -930,6 +1004,10 @@ bool Audio::httpPrint(const char* host) {
         if (m_f_ssl) {
             m_client = static_cast<NetworkClientSecure*>(&clientsecure);
             if (m_f_ssl && port == 80) port = 443;
+            if (!prepareTlsClient()) {
+                stopSong();
+                return false;
+            }
         } else {
             m_client = static_cast<NetworkClient*>(&client);
         }
@@ -997,6 +1075,11 @@ bool Audio::httpRange(uint32_t seek, uint32_t length) {
 
     c_host.clone_from(m_currentHost);
     c_host.trim();
+    if (!audiolib::StreamTransportSecurity::canFollow(m_requireTls, c_host.get())) {
+        AUDIO_LOG_ERROR("Refusing HTTPS to HTTP range downgrade");
+        stopSong();
+        return false;
+    }
     auto dismantledHost = dismantle_host(c_host.get());
 
     //  https://edge.live.mp3.mdn.newmedia.nacamar.net:8000/ps-charivariwb/livestream.mp3;?user=ps-charivariwb;&pwd=ps-charivariwb-------
@@ -1048,6 +1131,10 @@ bool Audio::httpRange(uint32_t seek, uint32_t length) {
     if (m_f_ssl) {
         m_client = static_cast<NetworkClientSecure*>(&clientsecure);
         if (m_f_ssl && port == 80) port = 443;
+        if (!prepareTlsClient()) {
+            stopSong();
+            return false;
+        }
     } else {
         m_client = static_cast<NetworkClient*>(&client);
     }
@@ -1158,6 +1245,7 @@ bool Audio::connecttospeech(const char* speech, const char* lang) {
 
     m_f_running = true;
     m_f_ssl = false;
+    m_requireTls = false;
     m_f_tts = true;
     m_dataMode = HTTP_RESPONSE_HEADER;
     m_lastHost.assign(host);
@@ -3870,33 +3958,13 @@ const char* Audio::parsePlaylist_ASX() { // Advanced Stream Redirector
 uint16_t Audio::accomplish_m3u8_url() {
 
     for (uint16_t i = 0; i < m_linesWithURL.size(); i++) {
-
-        ps_ptr<char> tmp;
-
-        if (!m_linesWithURL[i].starts_with("http")) { //  playlist:   http://station.com/aaa/bbb/xxx.m3u8
-                                                      //  chunklist:  http://station.com/aaa/bbb/ddd.aac
-                                                      //  result:     http://station.com/aaa/bbb/ddd.aac
-            tmp = m_m3u8_host;
-            if (m_linesWithURL[i][0] != '/') { //  playlist:   http://station.com/aaa/bbb/xxx.m3u8  // tmp
-                                               //  chunklist:  ddd.aac                              // m_linesWithURL[i]
-                                               //  result:     http://station.com/aaa/bbb/ddd.aac   // m_linesWithURL[i]
-                int idx = tmp.last_index_of('/');
-                tmp[idx + 1] = '\0';
-                tmp.append(m_linesWithURL[i].get());
-                m_linesWithURL[i].clone_from(tmp);
-                continue;
-            } else { //  playlist:   http://station.com/aaa/bbb/xxx.m3u8
-                     //  chunklist:  /aaa/bbb/ddd.aac
-                     //  result:     http://station.com/aaa/bbb/ddd.aac
-                int idx = tmp.index_of('/', 8);
-                tmp[idx] = '\0';
-                tmp.append(m_linesWithURL[i].get());
-                m_linesWithURL[i].clone_from(tmp);
-                continue;
-            }
-        } else { /* nothing todo*/
-            continue;
+        const auto resolved = audiolib::StreamTransportSecurity::resolveUrl(m_m3u8_host.c_get(), m_linesWithURL[i].c_get());
+        if (!audiolib::StreamTransportSecurity::canFollow(m_requireTls, resolved)) {
+            AUDIO_LOG_ERROR("Refusing invalid HLS URL or HTTPS to HTTP downgrade");
+            stopSong();
+            return 0;
         }
+        m_linesWithURL[i].assign(resolved.c_str());
     }
     // for(uint16_t i = 0; i < m_linesWithURL.size(); i++) m_linesWithURL[i].println();
     return 0;
@@ -4076,33 +4144,23 @@ ps_ptr<char> Audio::m3u8redirection(uint8_t* codec) {
     }
 
     choosenLine++; // next line is the redirection url
+    if (choosenLine >= plcSize) {
+        AUDIO_LOG_ERROR("Missing HLS redirection URL");
+        stopSong();
+        return {};
+    }
 
     ps_ptr<char> result;
     ps_ptr<char> line;
     line.clone_from(m_playlistContent[choosenLine]);
 
-    if (line.starts_with("../")) {
-        // ../../2093120-b/RISMI/stream01/streamPlaylist.m3u8
-        while (line.starts_with("../")) { line.remove_prefix("../"); }
-        result.clone_from(m_currentHost);
-        int idx = result.last_index_of('/');
-        if (idx > 0 && (size_t)idx != result.strlen() - 1) result.truncate_at((size_t)idx + 1);
-        result.append(line.get());
-    } else if (!line.starts_with_icase("http")) {
-
-        // http://arcast.com.ar:1935/radio/radionar.stream/playlist.m3u8               m_lastHost
-        // chunklist_w789468022.m3u8                                                   line
-        // http://arcast.com.ar:1935/radio/radionar.stream/chunklist_w789468022.m3u8   --> result
-
-        result.clone_from(m_currentHost);
-        int pos = m_currentHost.last_index_of('/');
-        if (pos > 0) {
-            result.truncate_at((size_t)pos + 1);
-            result.append(line.get());
-        }
-    } else {
-        result.clone_from(line);
+    const auto resolved = audiolib::StreamTransportSecurity::resolveUrl(m_currentHost.c_get(), line.c_get());
+    if (!audiolib::StreamTransportSecurity::canFollow(m_requireTls, resolved)) {
+        AUDIO_LOG_ERROR("Refusing invalid HLS redirect or HTTPS to HTTP downgrade");
+        stopSong();
+        return {};
     }
+    result.assign(resolved.c_str());
 
     return result; // it's a redirection, a new m3u8 playlist
 }
@@ -4962,14 +5020,15 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
         }
 
         else if (rhl.starts_with_icase("location:")) {
-            int pos = rhl.index_of_icase("http", 0);
-            if (pos == -1) {
-                int doubleSlash = rhl.index_of("//");                   // e.g. location: //frontend.streamonkey.net/...  host: http://webstream.radiof.de/
-                if (doubleSlash >= 9) rhl.insert("http:", doubleSlash); // ==> http://frontend.streamonkey.net/fhn-radiof945/stream/mp3?aggregator=fh-tinyurl
-                pos = rhl.index_of_icase("http", 0);
+            ps_ptr<char> location = rhl.get() + 9;
+            location.trim();
+            const auto resolved = audiolib::StreamTransportSecurity::resolveUrl(m_currentHost.c_get(), location.c_get());
+            if (!audiolib::StreamTransportSecurity::canFollow(m_requireTls, resolved)) {
+                AUDIO_LOG_ERROR("Refusing invalid HTTP redirect or HTTPS to HTTP downgrade");
+                goto exit;
             }
-            if (pos >= 0) {
-                const char* c_host = (rhl.get() + pos);
+            {
+                const char* c_host = resolved.c_str();
                 if (!m_currentHost.equals(c_host)) { // prevent a loop
                     int pos_slash = indexOf(c_host, "/", 9);
                     if (pos_slash > 9) {
@@ -4979,17 +5038,15 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
                                 //    m_lastHost.assign(c_host);
                                 m_f_m3u8data = true;
                             }
-                            httpPrint(c_host);
+                            if (!httpPrint(c_host)) return false;
                             while (m_client->available()) audioFileRead(); // empty client buffer
                             return true;
                         }
                     }
                     info(*this, evt_info, "redirect to new host \"{}\"", c_host);
-                    httpPrint(c_host);
+                    if (!httpPrint(c_host)) return false;
                     return true;
                 }
-            } else {
-                AUDIO_LOG_WARN("unknown redirection: {}", rhl.c_get());
             }
         }
 
